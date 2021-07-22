@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ko" xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>Signup Form</title>
+</head>
+<body>
+  <div style="border: solid 1px black; padding: 2px; height: 600px; overflow-x: auto;">
+    <pre style="margin: 0;" id="jsonView"></pre>
+  </div>
+  <form th:action="@{/signup}" method="post">
+    <input type="hidden" th:name="${_csrf.parameterName}" th:value="${_csrf.token}" />
+    <button>다음</button>
+  </form>
+</body>
+<!--/*/
+<script th:inline="javascript">
+	const socialUser = JSON.parse('[[${socialUser}]]');
+	document.getElementById('jsonView').innerText = JSON.stringify(socialUser, null, 2);
+</script>
+/*/-->
+</html>
