@@ -1,17 +1,27 @@
 package com.jacknie.test.config
 
+import com.jacknie.test.config.oauth2.ReactiveClientAuthenticationManager
 import com.jacknie.test.config.social.*
+import com.jacknie.test.handler.AuthorizationHandler
 import com.jacknie.test.handler.IndexHandler
 import com.jacknie.test.handler.SignupHandler
+import com.jacknie.test.handler.TokenHandler
 import com.jacknie.test.model.MemberSocialType
 import com.jacknie.test.model.MemberSocialType.*
+import com.nimbusds.jose.jwk.RSAKey
+import java.security.KeyFactory
+import java.security.KeyStore
+import java.security.interfaces.RSAPrivateCrtKey
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.RSAPublicKeySpec
 import org.springframework.context.support.BeanDefinitionDsl
 import org.springframework.context.support.beans
 import org.springframework.core.env.Environment
 import org.springframework.core.env.get
 import org.springframework.core.io.ClassPathResource
 import org.springframework.http.HttpHeaders
-import org.springframework.http.MediaType
+import org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED
+import org.springframework.http.MediaType.TEXT_HTML
 import org.springframework.r2dbc.connection.init.ConnectionFactoryInitializer
 import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator
 import org.springframework.security.authentication.DelegatingReactiveAuthenticationManager
@@ -31,8 +41,10 @@ import org.springframework.security.oauth2.core.AuthorizationGrantType
 import org.springframework.security.oauth2.core.ClientAuthenticationMethod
 import org.springframework.security.web.server.SecurityWebFilterChain
 import org.springframework.security.web.server.authentication.AuthenticationWebFilter
+import org.springframework.security.web.server.authentication.RedirectServerAuthenticationEntryPoint
 import org.springframework.security.web.server.authentication.RedirectServerAuthenticationFailureHandler
 import org.springframework.security.web.server.context.WebSessionServerSecurityContextRepository
+import org.springframework.security.web.server.util.matcher.OrServerWebExchangeMatcher
 import org.springframework.security.web.server.util.matcher.PathPatternParserServerWebExchangeMatcher
 import org.springframework.web.reactive.function.server.router
 import org.springframework.web.server.WebFilter
@@ -57,11 +69,17 @@ fun beans() = beans {
     bean {
         val indexHandler = ref<IndexHandler>()
         val signupHandler = ref<SignupHandler>()
+        val authHandler = ref<AuthorizationHandler>()
+        val tokenHandler = ref<TokenHandler>()
         router {
-            accept(MediaType.TEXT_HTML).nest {
+            accept(TEXT_HTML).nest {
                 GET("/auth", indexHandler::getIndex)
                 GET("/signup", signupHandler::getSignupForm)
                 POST("/signup", signupHandler::postSignupProcess)
+            }
+            "/oauth2".nest {
+                GET("/authorize", queryParam("response_type", "code"::equals), authHandler::getAuthorizationCode)
+                POST("/token", accept(APPLICATION_FORM_URLENCODED), tokenHandler::postToken)
             }
         }
     }
@@ -73,7 +91,22 @@ fun beans() = beans {
     bean { PasswordEncoderFactories.createDelegatingPasswordEncoder() }
     bean { SocialUnregisteredUserRepository() }
     bean { WebSessionServerSecurityContextRepository() }
-    bean { securityWebFilterChain() }
+    bean { oauth2SecurityWebFilterChain() }
+    bean { loginSecurityWebFilterChain() }
+    bean { tokenSecurityWebFilterChain() }
+    bean {
+        val resource = ClassPathResource("keystore.p12")
+        val keyStore = KeyStore.getInstance("jks")
+        keyStore.load(resource.inputStream, "1234567890".toCharArray())
+        val privateKey = keyStore.getKey("webflux-oauth2-sample", "1234567890".toCharArray()) as RSAPrivateCrtKey
+        val spec = RSAPublicKeySpec(privateKey.modulus, privateKey.publicExponent)
+        val publicKey = KeyFactory.getInstance("RSA").generatePublic(spec) as RSAPublicKey
+        RSAKey.Builder(publicKey)
+            .privateKey(privateKey)
+            .keyStore(keyStore)
+            .keyID("webflux-oauth2-sample")
+            .build()
+    }
     // */
 }
 
@@ -90,23 +123,49 @@ fun BeanDefinitionDsl.BeanSupplierContext.reactiveClientRegistrationRepository()
     return InMemoryReactiveClientRegistrationRepository(clients)
 }
 
-fun BeanDefinitionDsl.BeanSupplierContext.securityWebFilterChain(): SecurityWebFilterChain = ref<ServerHttpSecurity>()
-    .securityContextRepository(ref())
-    .authorizeExchange {
-        it
-            .pathMatchers("/signup/**").permitAll()
-            .pathMatchers("/ppu/**").permitAll()
-            .anyExchange().authenticated()
-    }
-    .oauth2Login()
-        .authenticationManager(oauth2AuthenticationManager())
-        .authenticationFailureHandler(
-            SocialServerAuthenticationFailureHandler("/login?error", "/signup", ref())
+fun BeanDefinitionDsl.BeanSupplierContext.oauth2SecurityWebFilterChain(): SecurityWebFilterChain {
+    return ref<ServerHttpSecurity>()
+        .csrf().disable()
+        .logout().disable()
+        .securityContextRepository(ref())
+        .securityMatcher(PathPatternParserServerWebExchangeMatcher("/oauth2/authorize"))
+        .authorizeExchange { it.anyExchange().authenticated() }
+        .exceptionHandling {
+            it.authenticationEntryPoint(RedirectServerAuthenticationEntryPoint("/login"))
+        }
+        .build()
+}
+
+fun BeanDefinitionDsl.BeanSupplierContext.tokenSecurityWebFilterChain(): SecurityWebFilterChain {
+    return ref<ServerHttpSecurity>()
+        .csrf().disable()
+        .logout().disable()
+        .httpBasic().authenticationManager(ReactiveClientAuthenticationManager(ref(), ref())).and()
+        .securityMatcher(PathPatternParserServerWebExchangeMatcher("/oauth2/token"))
+        .authorizeExchange { it.anyExchange().authenticated() }
+        .build()
+}
+
+fun BeanDefinitionDsl.BeanSupplierContext.loginSecurityWebFilterChain(): SecurityWebFilterChain {
+    return ref<ServerHttpSecurity>()
+        .securityContextRepository(ref())
+        .securityMatcher(
+            OrServerWebExchangeMatcher(
+                PathPatternParserServerWebExchangeMatcher("/login/**"),
+                PathPatternParserServerWebExchangeMatcher("/oauth2/authorization/**"),
+                PathPatternParserServerWebExchangeMatcher("/signup/**"),
+            )
         )
-        .and()
-    .formLogin().and()
-    .addFilterBefore(socialAuthenticationWebFilter(), SecurityWebFiltersOrder.FORM_LOGIN)
-    .build()
+        .oauth2Login()
+            .authenticationManager(oauth2AuthenticationManager())
+            .authenticationFailureHandler(
+                SocialServerAuthenticationFailureHandler("/login?error", "/signup", ref())
+            )
+            .and()
+        .formLogin().and()
+        .addFilterBefore(socialAuthenticationWebFilter(), SecurityWebFiltersOrder.FORM_LOGIN)
+        .build()
+}
 
 fun BeanDefinitionDsl.BeanSupplierContext.socialAuthenticationWebFilter(): WebFilter {
     val userDetailsService = SocialReactiveUserDetailsService(ref(), ref())
